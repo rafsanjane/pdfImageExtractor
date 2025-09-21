@@ -85,6 +85,7 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
 def make_response(data: dict, status=200):
     if "Website" in data:
         data.pop("Website")
+    data["Developer"] = "Rafsan The Developer"
     data["Website"] = "rafsanjane.com"
     return jsonify(data), status
 
