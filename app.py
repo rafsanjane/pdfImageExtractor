@@ -83,10 +83,9 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
 
 # ✅ Helper response wrapper
 def make_response(data: dict, status=200):
-    """Attach TG_Channel at the end and return JSON response with proper formatting."""
-    if "TG_Channel" in data:
-        data.pop("TG_Channel")
-    data["TG_Channel"] = "@UNKNOWN_X_1337_BOT"
+    if "Website" in data:
+        data.pop("Website")
+    data["Website"] = "rafsanjane.com"
     return jsonify(data), status
 
 @app.route("/")
