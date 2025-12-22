@@ -27,40 +27,93 @@ def generate_random_number(length=30):
     return ''.join([str(random.randint(0, 9)) for _ in range(length)])
 
 def extract_images_from_pdf(pdf_file_path: str, output_path: str):
-    """
-    Extract images from a PDF and rename:
-      - user-img-<30digits>.<ext>
-      - sign-img-<30digits>.<ext>
-    But selection is NOT order-based anymore (fix for PDFs where signature comes first).
-    Returns list of saved filenames where:
-      [0] = user image, [1] = sign image (if found), others after.
-    """
     try:
         import hashlib
         import math
 
         reader = PdfReader(pdf_file_path)
         seen_images = set()
-        images = []  # each item: {"data":bytes, "ext":str, "w":int, "h":int, "ratio":float, "area":int, "has_alpha":bool}
+        images = []
 
-        def has_transparency(pil_img: Image.Image) -> bool:
-            return (
-                pil_img.mode in ("RGBA", "LA")
-                or (pil_img.mode == "P" and "transparency" in pil_img.info)
-            )
+        PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+        def detect_ext(data: bytes, fallback_ext: str) -> str:
+            if data.startswith(PNG_SIG):
+                return ".png"
+            if len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8:
+                return ".jpg"
+            return fallback_ext if fallback_ext else ".png"
+
+        def parse_png_size_and_alpha(data: bytes):
+            # PNG IHDR: width @16..19, height @20..23, color_type @25
+            if not data.startswith(PNG_SIG) or len(data) < 33:
+                return (0, 0, False)
+            try:
+                w = int.from_bytes(data[16:20], "big")
+                h = int.from_bytes(data[20:24], "big")
+                color_type = data[25]
+                has_alpha = color_type in (4, 6)  # 4=GA, 6=RGBA
+                return (w, h, has_alpha)
+            except Exception:
+                return (0, 0, False)
+
+        def parse_jpeg_size(data: bytes):
+            # Minimal JPEG SOF scan (no PIL needed)
+            if len(data) < 4 or not (data[0] == 0xFF and data[1] == 0xD8):
+                return (0, 0)
+            pos = 2
+            sof_markers = {
+                0xC0, 0xC1, 0xC2, 0xC3,
+                0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB,
+                0xCD, 0xCE, 0xCF
+            }
+            while pos < len(data):
+                if data[pos] != 0xFF:
+                    pos += 1
+                    continue
+                # skip fill 0xFF
+                while pos < len(data) and data[pos] == 0xFF:
+                    pos += 1
+                if pos >= len(data):
+                    break
+                marker = data[pos]
+                pos += 1
+
+                # markers without length
+                if marker in (0xD8, 0xD9):  # SOI/EOI
+                    continue
+                if marker == 0xDA:  # SOS (start of scan) -> stop
+                    break
+                if pos + 2 > len(data):
+                    break
+
+                seg_len = int.from_bytes(data[pos:pos+2], "big")
+                pos += 2
+                if seg_len < 2 or pos + (seg_len - 2) > len(data):
+                    break
+
+                if marker in sof_markers:
+                    # segment: [precision(1), height(2), width(2), ...]
+                    if pos + 5 <= len(data):
+                        h = int.from_bytes(data[pos+1:pos+3], "big")
+                        w = int.from_bytes(data[pos+3:pos+5], "big")
+                        return (w, h)
+                    break
+
+                pos += (seg_len - 2)
+            return (0, 0)
 
         def is_portrait_like(w: int, h: int) -> bool:
             if h == 0:
                 return False
             r = w / h
-            # Your earlier ratios (common portrait crops)
             targets = [3/4, 4/5, 5/6]
             if any(math.isclose(r, t, rel_tol=0.06) for t in targets):
                 return True
-            # fallback portrait-ish
             return h > w and 0.60 <= r <= 0.95
 
-        # 1) Collect unique images (stable hash)
+        # 1) Collect unique images
         for page in reader.pages:
             for image in page.images:
                 image_data = image.data
@@ -71,7 +124,7 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
 
                 ext = os.path.splitext(image.name)[1].lower()
 
-                # Convert JP2/JPEG2000 to PNG (same as your code)
+                # Convert JP2/JPEG2000 to PNG (PIL needed here)
                 if ext in [".jp2", ".jpx"]:
                     try:
                         with Image.open(io.BytesIO(image_data)) as img:
@@ -85,16 +138,25 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
                         logging.error(f"Failed to convert JP2 to PNG: {e}")
                         continue
 
-                # Read meta
-                try:
-                    with Image.open(io.BytesIO(image_data)) as im:
-                        w, h = im.size
-                        ratio = (w / h) if h else 0.0
-                        area = w * h
-                        alpha = has_transparency(im)
-                except Exception as e:
-                    logging.error(f"Failed to read image meta: {e}")
-                    w, h, ratio, area, alpha = 0, 0, 0.0, 0, False
+                # ✅ FAST META (no PIL open for JPG/PNG)
+                ext = detect_ext(image_data, ext)
+
+                if ext == ".png":
+                    w, h, alpha = parse_png_size_and_alpha(image_data)
+                elif ext in [".jpg", ".jpeg"]:
+                    w, h = parse_jpeg_size(image_data)
+                    alpha = False
+                else:
+                    # last fallback: try PIL if available
+                    try:
+                        with Image.open(io.BytesIO(image_data)) as im:
+                            w, h = im.size
+                            alpha = (im.mode in ("RGBA", "LA")) or (im.mode == "P" and "transparency" in im.info)
+                    except Exception:
+                        w, h, alpha = 0, 0, False
+
+                ratio = (w / h) if h else 0.0
+                area = w * h
 
                 images.append({
                     "data": image_data,
@@ -109,8 +171,7 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
         if not images:
             return []
 
-        # 2) Pick USER image:
-        # Prefer portrait-ish JPG/JPEG; else choose largest area
+        # 2) Pick USER image
         jpg_portraits = [
             i for i, im in enumerate(images)
             if im["ext"] in [".jpg", ".jpeg"] and is_portrait_like(im["w"], im["h"])
@@ -122,8 +183,7 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
 
         user_area = images[user_idx]["area"]
 
-        # 3) Pick SIGN image:
-        # Prefer PNG (often signature), wide-ish, smaller than user, alpha helps
+        # 3) Pick SIGN image
         remaining = [i for i in range(len(images)) if i != user_idx]
         sign_idx = None
 
@@ -134,15 +194,12 @@ def extract_images_from_pdf(pdf_file_path: str, output_path: str):
                 wide = 1 if im["ratio"] > 1.4 else 0
                 small = 1 if (user_area > 0 and im["area"] < user_area * 0.50) else 0
                 alpha = 1 if im["has_alpha"] else 0
-                # higher better; tie-break with smaller area
                 return (wide + small + alpha, -im["area"])
-
             sign_idx = max(pngs, key=sign_score)
         elif remaining:
-            # fallback: pick the smallest other image as sign
             sign_idx = min(remaining, key=lambda i: images[i]["area"])
 
-        # 4) Save in correct order: user first, sign second, others after
+        # 4) Save in correct order
         ordered = [user_idx]
         if sign_idx is not None:
             ordered.append(sign_idx)
